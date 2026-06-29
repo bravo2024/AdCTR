@@ -1,0 +1,11 @@
+[server]
+headless = true
+runOnSave = false
+fileWatcherType = "none"
+
+[theme]
+base = "light"
+primaryColor = "#1f77b4"
+
+[browser]
+gatherUsageStats = false

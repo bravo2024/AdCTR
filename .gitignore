@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+data/raw/
+data/processed/
+models/*.pkl
+models/*.npz
+models/*.pt
+models/*.onnx
+models/metrics.json
+models/*.png
+.pytest_cache/
+.DS_Store
