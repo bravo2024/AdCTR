@@ -1,46 +1,90 @@
+from __future__ import annotations
+"""CTR-prediction metrics for AdCTR (InMobi), implemented from scratch.
 
-"""core.py - dependency-free ML primitives (pure NumPy)."""
+These are the standard online-ad metrics, not generic classification metrics:
+  * **Normalized Entropy (NE)** — log loss divided by the background (base-rate)
+    entropy, so it is scale-free and in ~[0, 1]; lower is better (He et al. 2014).
+  * **AUC** — rank-based Mann-Whitney statistic with tie handling.
+  * **Calibration curve** — predicted vs. observed CTR per score bin.
+  * **lift@k** — CTR among the top-k% scored impressions relative to baseline.
+"""
 import numpy as np
-def train_test_split(X,y,test_size=0.2,seed=42):
-    X,y=np.asarray(X,float),np.asarray(y); rng=np.random.default_rng(seed)
-    idx=rng.permutation(len(X)); n=max(1,int(len(X)*test_size))
-    return X[idx[n:]],X[idx[:n]],y[idx[n:]],y[idx[:n]]
-class Standardizer:
-    def fit(self,X):
-        X=np.asarray(X,float); self.mu_=X.mean(0); self.sd_=X.std(0)+1e-8; return self
-    def transform(self,X): return (np.asarray(X,float)-self.mu_)/self.sd_
-    def fit_transform(self,X): return self.fit(X).transform(X)
-def sigmoid(z): return 1.0/(1.0+np.exp(-np.clip(z,-35,35)))
-class LogisticRegression:
-    def __init__(self,lr=0.2,epochs=400,l2=1e-3,seed=0): self.lr,self.epochs,self.l2,self.seed=lr,epochs,l2,seed
-    def fit(self,X,y):
-        X=np.asarray(X,float); y=np.asarray(y,float); n,d=X.shape; rng=np.random.default_rng(self.seed)
-        self.w_=rng.normal(0,0.01,d); self.b_=0.0
-        pos=max(y.sum(),1.0); neg=max((1-y).sum(),1.0); sw=np.where(y==1,n/(2*pos),n/(2*neg))
-        for _ in range(self.epochs):
-            p=sigmoid(X@self.w_+self.b_); err=(p-y)*sw
-            self.w_-=self.lr*(X.T@err/n+self.l2*self.w_); self.b_-=self.lr*err.mean()
-        return self
-    def predict_proba(self,X): return sigmoid(np.asarray(X,float)@self.w_+self.b_)
-    def predict(self,X,t=0.5): return (self.predict_proba(X)>=t).astype(int)
-class RidgeRegression:
-    def __init__(self,alpha=1.0): self.alpha=alpha
-    def fit(self,X,y):
-        X=np.asarray(X,float); y=np.asarray(y,float); Xb=np.hstack([np.ones((len(X),1)),X])
-        A=Xb.T@Xb+self.alpha*np.eye(Xb.shape[1]); A[0,0]-=self.alpha
-        self.coef_=np.linalg.solve(A,Xb.T@y); return self
-    def predict(self,X): return np.hstack([np.ones((len(X),1)),np.asarray(X,float)])@self.coef_
-def roc_auc_score(y,s):
-    y=np.asarray(y); s=np.asarray(s,float); npos=(y==1).sum(); nneg=(y==0).sum()
-    if npos==0 or nneg==0: return float("nan")
-    order=np.argsort(s); ranks=np.empty(len(s)); ranks[order]=np.arange(1,len(s)+1)
-    return float((ranks[y==1].sum()-npos*(npos+1)/2)/(npos*nneg))
-def accuracy_score(y,p): return float((np.asarray(y)==np.asarray(p)).mean())
-def f1_score(y,p):
-    y,p=np.asarray(y),np.asarray(p); tp=int(((p==1)&(y==1)).sum()); fp=int(((p==1)&(y==0)).sum()); fn=int(((p==0)&(y==1)).sum())
-    pr=tp/(tp+fp) if tp+fp else 0.0; rc=tp/(tp+fn) if tp+fn else 0.0
-    return float(2*pr*rc/(pr+rc)) if pr+rc else 0.0
-def rmse(y,p): return float(np.sqrt(np.mean((np.asarray(y,float)-np.asarray(p,float))**2)))
-def mape(y,p):
-    y=np.asarray(y,float); p=np.asarray(p,float); m=np.abs(y)>1e-8
-    return float(np.mean(np.abs((y[m]-p[m])/y[m]))*100)
+
+
+def log_loss(y, p, eps: float = 1e-15) -> float:
+    p = np.clip(np.asarray(p, dtype=float), eps, 1 - eps)
+    y = np.asarray(y, dtype=float)
+    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+
+def _background_entropy(y) -> float:
+    pbar = float(np.clip(np.asarray(y, dtype=float).mean(), 1e-7, 1 - 1e-7))
+    return -(pbar * np.log(pbar) + (1 - pbar) * np.log(1 - pbar))
+
+
+def normalized_entropy(y, p) -> float:
+    """NE = log_loss / background_entropy in ~[0,1] (lower is better)."""
+    bg = _background_entropy(y)
+    if bg <= 0:
+        return 0.0
+    return log_loss(y, p) / bg
+
+
+def _rankdata(a) -> np.ndarray:
+    """Average ranks (1-based) with tie handling, from scratch."""
+    a = np.asarray(a, dtype=float)
+    order = np.argsort(a, kind="mergesort")
+    ranks = np.empty(len(a), dtype=float)
+    a_sorted = a[order]
+    i = 0
+    while i < len(a):
+        j = i
+        while j + 1 < len(a) and a_sorted[j + 1] == a_sorted[i]:
+            j += 1
+        ranks[order[i:j + 1]] = (i + 1 + j + 1) / 2.0
+        i = j + 1
+    return ranks
+
+
+def auc(y, p) -> float:
+    """Mann-Whitney AUC = (sum_ranks_pos - n_pos*(n_pos+1)/2) / (n_pos*n_neg)."""
+    y = np.asarray(y)
+    p = np.asarray(p, dtype=float)
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+    ranks = _rankdata(p)
+    s = ranks[y == 1].sum()
+    return float((s - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+def calibration_curve(y, p, n_bins: int = 10):
+    """Quantile-binned predicted vs. observed CTR. Returns (pred, obs, count)."""
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    qs = np.quantile(p, np.linspace(0, 1, n_bins + 1))
+    qs[0] -= 1e-9
+    qs[-1] += 1e-9
+    idx = np.clip(np.digitize(p, qs[1:-1]), 0, n_bins - 1)
+    pred, obs, cnt = [], [], []
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum() == 0:
+            continue
+        pred.append(float(p[m].mean()))
+        obs.append(float(y[m].mean()))
+        cnt.append(int(m.sum()))
+    return np.array(pred), np.array(obs), np.array(cnt)
+
+
+def lift_at_k(y, p, k: float = 0.1) -> float:
+    """CTR in the top-k% scored impressions divided by the baseline CTR (>=1 is skilful)."""
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    m = max(1, int(round(k * len(y))))
+    order = np.argsort(-p, kind="mergesort")
+    overall = y.mean()
+    if overall <= 0:
+        return 1.0
+    return float(y[order[:m]].mean() / overall)

@@ -1,111 +1,92 @@
+from __future__ import annotations
+"""Synthetic ad-impression data for AdCTR (InMobi) CTR prediction.
 
-"""data.py - Avazu-style realistic CTR dataset + CSV loader."""
-from pathlib import Path
+Each row is a single ad impression with user, creative, placement and context
+features. Clicks are rare: the base CTR is ~2% and the click probability is driven
+by realistic *interactions* (ad-category × user-interest relevance, ad position,
+device, time-of-day peaks) rather than a single additive linear score. This
+produces a heavily imbalanced binary target that mirrors real display-ad logs.
+"""
 import numpy as np
+import pandas as pd
 
-FEATURES = ["feat_%02d" % i for i in range(12)]
-
-# Avazu field names matching the real Kaggle challenge schema
-AVAZU_FEATURES = [
-    "banner_pos", "device_type", "device_conn_type",
-    "site_category", "app_category", "hour_of_day",
-    "C1", "C14", "C15", "C16", "C17", "C18", "C19", "C21",
+FEATURE_NAMES = [
+    "age_group", "gender", "interest_segment", "ad_category", "creative_format",
+    "advertiser_industry", "creative_id", "site_category", "ad_position", "ad_size",
+    "device_type", "operating_system", "connection_type", "hour_of_day", "day_of_week",
 ]
+CATEGORICAL_FEATURES = [
+    "age_group", "gender", "interest_segment", "ad_category", "creative_format",
+    "advertiser_industry", "creative_id", "site_category", "ad_position", "ad_size",
+    "device_type", "operating_system", "connection_type",
+]
+NUMERICAL_FEATURES = ["hour_of_day", "day_of_week"]
+TARGET_NAME = "click"
+
+_CATS = ["tech", "auto", "finance", "retail", "travel", "food", "sports", "ent"]
+_SITE_MATCH = {
+    "news": {"finance", "tech"}, "social": {"ent", "food"},
+    "shopping": {"retail", "auto"}, "video": {"ent", "sports"},
+    "blog": {"travel", "food"},
+}
 
 
-def make_realistic_ctr(n: int = 60_000, seed: int = 42):
-    """Avazu-style CTR dataset with realistic click rates (~2.7%) and feature patterns.
-
-    Feature engineering mirrors the real Avazu Kaggle challenge (2014):
-    - banner_pos: ad position on page (0 = premium centre → highest CTR)
-    - device_type: 0 = mobile, 1 = desktop, 2 = tablet
-    - device_conn_type: 0 = WiFi, 2 = 3G, 5 = 4G
-    - site/app category: frequency-encoded category hash buckets
-    - hour_of_day: local hour (CTR peaks 10h-20h)
-    - C1, C14–C21: anonymised categorical features from Avazu
-    """
+def make_synthetic(n: int = 20000, seed: int = 42) -> dict:
     rng = np.random.default_rng(seed)
 
-    banner_pos      = rng.integers(0, 7, n)           # 0=best position
-    device_type     = rng.integers(0, 5, n)           # 0=mobile, 1=desktop
-    device_conn     = rng.choice([0, 2, 5], n)        # WiFi/3G/4G
-    site_cat        = rng.integers(0, 26, n)
-    app_cat         = rng.integers(0, 36, n)
-    hour            = rng.integers(0, 24, n)
-    C1              = rng.integers(1000, 1010, n)
-    C14             = rng.integers(375, 30000, n)
-    C15             = rng.choice([50, 250, 320], n)   # banner height px
-    C16             = rng.choice([50, 320, 480], n)   # banner width px
-    C17             = rng.integers(112, 2762, n)
-    C18             = rng.integers(0, 4, n)
-    C19             = rng.integers(35, 68, n)
-    C21             = rng.integers(23, 102, n)
+    age_group = rng.choice(["18-24", "25-34", "35-44", "45-54", "55+"], n, p=[.20, .25, .25, .20, .10])
+    gender = rng.choice(["M", "F", "U"], n, p=[.45, .45, .10])
+    interest = rng.choice(_CATS, n)
+    ad_category = rng.choice(_CATS, n)
+    creative_format = rng.choice(["banner", "video", "native", "carousel"], n, p=[.40, .25, .20, .15])
+    advertiser_industry = rng.choice(_CATS, n)
+    creative_id = rng.choice([f"cr{i:02d}" for i in range(30)], n)
+    site_category = rng.choice(["news", "social", "shopping", "video", "blog"], n, p=[.30, .25, .20, .15, .10])
+    ad_position = rng.choice(["top", "middle", "bottom", "side"], n, p=[.30, .30, .20, .20])
+    ad_size = rng.choice(["300x250", "728x90", "160x600", "320x50"], n, p=[.35, .25, .20, .20])
+    device = rng.choice(["mobile", "desktop", "tablet"], n, p=[.60, .30, .10])
+    os_ = rng.choice(["android", "ios", "windows", "macos"], n, p=[.40, .25, .20, .15])
+    hour = rng.integers(0, 24, n)
+    dow = rng.integers(0, 7, n)
+    conn = rng.choice(["wifi", "4g", "3g"], n, p=[.50, .35, .15])
 
-    X = np.column_stack([banner_pos, device_type, device_conn,
-                          site_cat, app_cat, hour,
-                          C1, C14, C15, C16, C17, C18, C19, C21])
+    # ---- click logit: base rate + main effects + key interactions ----
+    logit = np.full(n, -4.7)
+    logit += 1.2 * (ad_category == interest)                                   # relevance match
+    logit += np.where(ad_position == "top", 0.8,
+              np.where(ad_position == "middle", 0.2,
+              np.where(ad_position == "bottom", -0.3, -0.2)))
+    logit += np.where(creative_format == "video", 0.6,
+              np.where(creative_format == "native", 0.3,
+              np.where(creative_format == "carousel", 0.1, 0.0)))
+    logit += np.where(device == "mobile", 0.2, np.where(device == "tablet", -0.1, 0.0))
+    peak = ((hour >= 7) & (hour <= 9)) | ((hour >= 12) & (hour <= 14)) | ((hour >= 19) & (hour <= 22))
+    logit += np.where(peak, 0.4, 0.0)
+    logit += np.where(dow >= 5, -0.2, 0.0)
+    site_match = np.array([ad_category[i] in _SITE_MATCH[site_category[i]] for i in range(n)])
+    logit += 0.5 * site_match
+    logit += np.where(conn == "3g", -0.2, np.where(conn == "wifi", 0.1, 0.0))
+    logit += np.where(age_group == "18-24", 0.3, np.where(age_group == "25-34", 0.2, 0.0))
+    cr_quality = {f"cr{i:02d}": rng.normal(0, 0.25) for i in range(30)}        # per-creative lift
+    logit += np.array([cr_quality[c] for c in creative_id])
+    logit += rng.normal(0, 0.15, n)
 
-    # Realistic click probability generation
-    # Position 0 (centre/premium) has ~2× CTR of side positions
-    pos_effect    = np.where(banner_pos == 0, 0.6, -0.15 * banner_pos)
-    # Mobile slightly higher CTR than desktop
-    device_effect = np.where(device_type == 0, 0.25,
-                    np.where(device_type == 1, -0.15, 0.0))
-    # 4G users more engaged
-    conn_effect   = np.where(device_conn == 5, 0.15, 0.0)
-    # Hour curve: bell around 14h
-    hour_effect   = -0.4 * ((hour - 14) / 12.0) ** 2 + 0.1
-    # Banner size: larger banners get more clicks
-    size_effect   = 0.1 * (C15 / 320.0 + C16 / 480.0 - 1.0)
+    p = 1.0 / (1.0 + np.exp(-np.clip(logit, -30, 30)))
+    y = rng.binomial(1, p).astype(float)
 
-    logits = (-3.6 + pos_effect + device_effect + conn_effect
-              + hour_effect + size_effect + rng.normal(0, 0.4, n))
-    probs  = 1.0 / (1.0 + np.exp(-logits))
-    y      = (rng.random(n) < probs).astype(int)
-
+    df = pd.DataFrame({
+        "age_group": age_group, "gender": gender, "interest_segment": interest,
+        "ad_category": ad_category, "creative_format": creative_format,
+        "advertiser_industry": advertiser_industry, "creative_id": creative_id,
+        "site_category": site_category, "ad_position": ad_position, "ad_size": ad_size,
+        "device_type": device, "operating_system": os_, "connection_type": conn,
+        "hour_of_day": hour, "day_of_week": dow, TARGET_NAME: y, "true_p": p,
+    })
+    X = df[FEATURE_NAMES].copy()
     return {
-        "X": X, "y": y, "features": AVAZU_FEATURES,
-        "ctr_rate": float(y.mean()),
-        "source": "Avazu-style synthetic CTR (60 k impressions, ~2.7% CTR)",
-        "n_impressions": n,
-        "feature_meta": {
-            "banner_pos":      "Ad position on page (0=premium centre)",
-            "device_type":     "0=mobile 1=desktop 2=tablet 3=phone 4=other",
-            "device_conn_type":"0=WiFi 2=3G 5=4G",
-            "site_category":   "Site content-category hash bucket (0-25)",
-            "app_category":    "App-store category hash bucket (0-35)",
-            "hour_of_day":     "Local hour of impression (0-23)",
-            "C1":              "Anonymised categorical feature 1",
-            "C14":             "Anonymised categorical feature 14",
-            "C15":             "Banner height in pixels",
-            "C16":             "Banner width in pixels",
-            "C17":             "Anonymised categorical feature 17",
-            "C18":             "Anonymised categorical feature 18",
-            "C19":             "Anonymised categorical feature 19",
-            "C21":             "Anonymised categorical feature 21",
-        },
+        "X": X, "y": y, "df": df, "features": list(FEATURE_NAMES),
+        "categorical_features": list(CATEGORICAL_FEATURES),
+        "numerical_features": list(NUMERICAL_FEATURES),
+        "target_name": TARGET_NAME, "n_samples": int(n),
+        "ctr": float(y.mean()), "n_features": len(FEATURE_NAMES),
     }
-
-
-def make_synthetic(n: int = 4000, seed: int = 42):
-    rng = np.random.default_rng(seed)
-    d = len(FEATURES)
-    X = rng.normal(size=(n, d))
-    w = rng.normal(size=d) * (rng.random(d) < 0.5)
-    logits = X @ w + 0.6 * X[:, 0] * X[:, 1] - 1.4
-    y = (rng.random(n) < 1 / (1 + np.exp(-logits))).astype(int)
-    return {"X": X, "y": y, "features": FEATURES,
-            "ctr_rate": float(y.mean()), "source": "Synthetic (12 generic features)"}
-
-
-def load_real(csv_name, target):
-    import pandas as pd
-    df = pd.read_csv(Path("data/raw") / csv_name)
-    num = df.drop(columns=[target]).select_dtypes("number")
-    return {"X": num.to_numpy(), "y": df[target].astype(int).to_numpy(),
-            "features": list(num.columns)}
-
-
-if __name__ == "__main__":
-    d = make_realistic_ctr()
-    print("X", d["X"].shape, "CTR", f"{d['ctr_rate']:.3f}")
