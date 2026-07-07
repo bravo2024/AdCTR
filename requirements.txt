@@ -1,0 +1,10 @@
+# --- core (pinned, required to run) ---
+numpy>=1.26
+pandas>=2.0
+scikit-learn>=1.3
+streamlit>=1.30
+matplotlib>=3.7
+lightgbm>=4.0
+
+# --- optional: not imported anywhere yet, kept for future work ---
+# shap>=0.44
